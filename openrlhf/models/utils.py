@@ -29,7 +29,8 @@ def compute_approx_kl(
     # Besides non negative, it is also unbiased and have lower variance.
     if use_kl_estimator_k3:
         log_ratio = -log_ratio
-        log_ratio = log_ratio.exp() - 1 - log_ratio
+        k3_log_ratio = log_ratio.exp() - 1 - log_ratio
+        log_ratio = torch.where(log_ratio < 0, k3_log_ratio, torch.min(log_ratio, k3_log_ratio))
 
     return log_ratio
 

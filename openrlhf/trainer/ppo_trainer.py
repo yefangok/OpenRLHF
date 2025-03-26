@@ -228,6 +228,8 @@ class PPOTrainer(ABC):
             )
 
             for rand_prompts, labels in self.prompts_dataloader:
+                if steps > len(self.prompts_dataloader) / 2:
+                    self.generate_kwargs["temperature"] = 1.0
                 for i, experience in enumerate(
                     self.experience_maker.make_experience_list(rand_prompts, labels, **self.generate_kwargs)
                 ):
@@ -315,6 +317,8 @@ class PPOTrainer(ABC):
                 status_list.append(status)
                 pbar.set_postfix(short_status)
 
+        all_reward = torch.concatenate([state['reward2'] for state in status_list])
+
         if status_list:
             status_mean = status_list[0]
             for m in status_list[1:]:
@@ -323,6 +327,11 @@ class PPOTrainer(ABC):
             for k in status_mean.keys():
                 status_mean[k] /= len(status_list)
         torch.cuda.empty_cache()
+
+        status_mean.pop('reward2')
+        status_mean['format_error_ratio'] = (all_reward <= -0.9).float().mean()
+        status_mean['wrong_answer_ratio'] = (all_reward == -0.5).float().mean()
+        status_mean['all_correct_ratio'] = (all_reward == 1).float().mean()
         return status_mean
 
     def training_step(self, experience: Experience, global_steps) -> Dict[str, float]:
@@ -445,6 +454,9 @@ class PPOTrainer(ABC):
                 status[k] = (
                     (v * experience.info["response_length"]).sum() / experience.info["response_length"].sum()
                 ).item()
+            elif k== "reward":
+                status['reward2'] = v.cpu()
+                status[k] = v.mean().item()
             else:
                 status[k] = v.mean().item()
         return status

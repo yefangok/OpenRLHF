@@ -88,7 +88,9 @@ def train(args):
             bf16=args.bf16,
             load_in_4bit=args.load_in_4bit,
             ds_config=strategy.get_ds_eval_config(offload=False),
+            device_map='meta'
         )
+        #initial_model = actor
 
     if args.enable_ema:
         ema_model = Actor(
@@ -157,7 +159,7 @@ def train(args):
 
     # prepare dataloader
     prompts_dataloader = strategy.setup_dataloader(
-        prompts_dataset, args.rollout_batch_size // strategy.world_size, True, True
+        prompts_dataset, args.rollout_batch_size // strategy.world_size, True, False
     )
     if args.pretrain_data:
         pretrain_dataloader = itertools.cycle(
@@ -181,7 +183,7 @@ def train(args):
     max_steps = math.ceil(args.num_episodes * num_update_steps_per_episodes)
 
     actor_scheduler = get_scheduler(
-        "cosine_with_min_lr",
+        "cosine_with_min_lr",   #"constant",
         actor_optim,
         num_warmup_steps=math.ceil(max_steps * args.lr_warmup_ratio),
         num_training_steps=max_steps,
@@ -204,12 +206,12 @@ def train(args):
         (actor, actor_optim, actor_scheduler),
         (critic, critic_optim, critic_scheduler),
         reward_model,
-        initial_model,
+        #initial_model,
     ) = strategy.prepare(
         (actor, actor_optim, actor_scheduler),
         (critic, critic_optim, critic_scheduler),
         reward_model,
-        initial_model,
+        #initial_model,
         is_rlhf=True,
     )
 
@@ -370,6 +372,9 @@ if __name__ == "__main__":
     )
 
     parser.add_argument("--use_kl_loss", action="store_true", default=False, help="whether to use KL loss from GRPO")
+
+    # packing samples using Flash Attention2
+    parser.add_argument("--packing_samples", action="store_true", default=False)
 
     # LoRA
     parser.add_argument("--load_in_4bit", action="store_true", default=False)

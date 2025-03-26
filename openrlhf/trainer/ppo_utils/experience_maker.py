@@ -156,11 +156,11 @@ class NaiveExperienceMaker(ABC):
 
         # custom reward func for reinforced finetuning
         self.custom_reward_func = None
-        if remote_rm_url and remote_rm_url[0].endswith(".py"):
-            print(f"Loading custom `reward_func(queries, prompts, labels)` from {remote_rm_url[0]}")
+        if remote_rm_url and remote_rm_url.endswith(".py"):
+            print(f"Loading custom `reward_func(queries, prompts)` from {remote_rm_url}")
             import importlib.util
 
-            spec = importlib.util.spec_from_file_location("reward_func", remote_rm_url[0])
+            spec = importlib.util.spec_from_file_location("reward_func", remote_rm_url)
             reward_module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(reward_module)
             self.custom_reward_func = reward_module.reward_func
@@ -197,7 +197,10 @@ class NaiveExperienceMaker(ABC):
         After that, we will calculate the advantages and returns for each experience.
         """
         args = self.strategy.args
-        samples_list = self.generate_samples(all_prompts, all_labels, **generate_kwargs)
+        
+        # generate responses
+        #samples_list = self.generate_samples(all_prompts, all_labels, **generate_kwargs)
+        samples_list = self.generate_samples_sgl(all_prompts, all_labels,**generate_kwargs)
         torch.distributed.barrier()
 
         experiences = []
@@ -256,6 +259,78 @@ class NaiveExperienceMaker(ABC):
             experience.to_device("cpu")
         return experiences
 
+    def generate_samples_sgl(self, all_prompts: List[str], all_labels,**generate_kwargs) -> List[Samples]:
+        """
+        Generate samples and return in batches.
+        """
+        assert not getattr(self, "packing_samples", False)
+        args = self.strategy.args
+        self.actor.eval()
+        # sample multiple response
+        all_prompts = sum([[prompt] * args.n_samples_per_prompt for prompt in all_prompts], [])
+        with self.actor.InferenceMode():
+            all_prompt_token_ids = self.tokenize_fn(all_prompts, self.prompt_max_len, padding=False)["input_ids"]
+            gen_text = self.actor.generate_sgl(all_prompt_token_ids, **generate_kwargs)
+
+        gen_token_ids = self.tokenizer(gen_text, padding=False)["input_ids"]
+        #############################
+
+        all_labels = sum([[label] * args.n_samples_per_prompt for label in all_labels], [])
+        samples_list = []
+        for i in range(0, len(all_prompts), args.micro_rollout_batch_size):
+            # 这里是参考下面 _generate_vllm 的 not self.packing_samples，注意同步相关代码
+            outputs = gen_token_ids[i : i + self.strategy.args.micro_rollout_batch_size]
+            prompts = all_prompts[i : i + self.strategy.args.micro_rollout_batch_size]
+            labels = all_labels[i : i + args.micro_rollout_batch_size]
+            prompt_ids = all_prompt_token_ids[i : i + self.strategy.args.micro_rollout_batch_size]
+            
+            # NOTE: concat all outputs to following format:
+            #
+            # | [PAD] [PAD] token token token | token token [EOS] [PAD] |
+            # | token token token token token | token token [EOS] [PAD] |
+            # | [PAD] [PAD] [PAD] token token | token token token [EOS] |
+            # |<---------- prompt ----------->|<-------- answer ------->|
+            max_input_len, max_output_len = 0, 0
+            for output,prompt in zip(outputs,prompt_ids):
+                max_input_len = max(max_input_len, len(prompt))
+                max_output_len = max(max_output_len, len(output))
+
+            pad_token_id, eos_token_id = self.tokenizer.pad_token_id, self.tokenizer.eos_token_id
+            sequences = []
+            for output,prompt in zip(outputs,prompt_ids):
+                # left padding input
+                input_len = len(prompt)
+                input_ids = [pad_token_id] * (max_input_len - input_len) + list(prompt)
+
+                # right padding output
+                output_len = len(output)
+                output_ids = list(output) + [pad_token_id] * (max_output_len - output_len)
+
+                # concat input and output
+                sequences.append(input_ids + output_ids)
+
+            sequences = torch.tensor(sequences)
+            sequences, attention_mask, action_mask = self.actor.process_sequences(
+                sequences, max_input_len, eos_token_id, pad_token_id
+            )
+            sequences = sequences.to("cuda")
+            attention_mask = attention_mask.to("cuda")
+            action_mask = action_mask.to("cuda")
+            samples_list.append(
+                Samples(
+                    sequences=sequences,
+                    attention_mask=attention_mask,
+                    action_mask=action_mask,
+                    num_actions=action_mask.size(1),
+                    packed_seq_lens=None,
+                    response_length=action_mask.float().sum(dim=-1),
+                    total_length=attention_mask.float().sum(dim=-1),
+                    prompts=prompts,
+                    labels=labels,
+                )
+            )
+        return samples_list
+
     @torch.no_grad()
     def generate_samples(self, all_prompts: List[str], all_labels, **generate_kwargs) -> List[Samples]:
         """
@@ -311,7 +386,8 @@ class NaiveExperienceMaker(ABC):
 
         # init log probs
         if self.initial_model is not None:
-            base_action_log_probs = self.initial_model(sequences, num_actions, attention_mask)
+            #base_action_log_probs = self.initial_model(sequences, num_actions, attention_mask)
+            base_action_log_probs = self.actor(sequences, num_actions, attention_mask,is_ref_model=True)
         else:
             base_action_log_probs = None
 

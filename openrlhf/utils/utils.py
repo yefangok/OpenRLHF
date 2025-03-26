@@ -1,6 +1,6 @@
 import os
 
-from datasets import interleave_datasets, load_dataset, load_from_disk
+from datasets import interleave_datasets, load_dataset, load_from_disk,concatenate_datasets
 from transformers import AutoTokenizer
 
 
@@ -44,8 +44,9 @@ def blending_datasets(
     eval_split="test",
 ):
     datasets = datasets.split(",")
-    probabilities = list(map(float, probabilities.split(",")))
-    assert len(probabilities) == len(datasets)
+    # probabilities = list(map(float, probabilities.split(",")))
+    # assert len(probabilities) == len(datasets)
+    probabilities = None
 
     train_data_list = []
     eval_data_list = []
@@ -72,6 +73,20 @@ def blending_datasets(
             data = load_dataset(ext, data_files=dataset)
             strategy.print(f"loaded {dataset} with data_files={dataset}")
         # local dataset saved with `datasets.Dataset.save_to_disk`
+        elif ext in [".parquet"]:
+            from datasets import Dataset,DatasetDict
+            data_path,_ = os.path.split(dataset)
+            train_data = Dataset.from_parquet(f'{data_path}/train.parquet')
+            test_data = Dataset.from_parquet(f'{data_path}/test.parquet')
+            
+            def prompt_trans(example):
+                import json
+                example['prompt'] = example['prompt'][0]['content']
+                example['ground_truth'] = json.dumps(example['reward_model']['ground_truth'],ensure_ascii=False)
+                return example
+            train_data = train_data.map(prompt_trans)
+            test_data = test_data.map(prompt_trans)
+            data = DatasetDict({"train":train_data,'test':test_data})
         elif os.path.isdir(dataset):
             data = load_from_disk(dataset)
             strategy.print(f"loaded {dataset} from disk")
@@ -98,12 +113,14 @@ def blending_datasets(
     if strategy.is_rank_0():
         print(train_data_list)
 
-    train_dataset = interleave_datasets(
-        train_data_list,
-        probabilities=probabilities,
-        seed=seed,
-        stopping_strategy=stopping_strategy,
-    )
+    # train_dataset = interleave_datasets(
+    #     train_data_list,
+    #     probabilities=probabilities,
+    #     seed=seed,
+    #     stopping_strategy=stopping_strategy,
+    # )
+    train_dataset = concatenate_datasets(train_data_list)
+    
     if return_eval:
         eval_dataset = interleave_datasets(
             eval_data_list,

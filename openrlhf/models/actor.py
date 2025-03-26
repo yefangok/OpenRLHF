@@ -1,16 +1,18 @@
+from contextlib import contextmanager
 from typing import Optional, Tuple, Union
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, TaskType, get_peft_model, BoneConfig, PeftModel, get_peft_model_state_dict
 from peft.tuners.lora import LoraLayer
 from transformers import AutoModelForCausalLM, BitsAndBytesConfig
 from transformers.integrations.deepspeed import HfDeepSpeedConfig
 
 from .ring_attn_utils import convert_ring_attn_params
 from .utils import log_probs_from_logits, reset_position_ids
-
+import sglang as sgl
+import copy
 
 class Actor(nn.Module):
     """
@@ -70,38 +72,64 @@ class Actor(nn.Module):
             else:
                 nf4_config = None
 
-            self.model = AutoModelForCausalLM.from_pretrained(
-                pretrain_or_model,
-                trust_remote_code=True,
-                attn_implementation=attn_implementation,
-                quantization_config=nf4_config,
-                torch_dtype=torch.bfloat16 if bf16 else "auto",
-                device_map=device_map,
-            )
-
-            # LoRA
-            if lora_rank > 0:
-                # https://github.com/huggingface/peft/issues/137
-                self.model.enable_input_require_grads()
-                lora_config = LoraConfig(
-                    task_type=TaskType.CAUSAL_LM,
-                    r=lora_rank,
-                    lora_alpha=lora_alpha,
-                    target_modules=target_modules,
-                    lora_dropout=lora_dropout,
-                    bias="none",
+            import os
+            if os.path.isdir(pretrain_or_model):
+                bone_config = BoneConfig.from_pretrained(pretrain_or_model)
+                base_model_name = bone_config.base_model_name_or_path
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    base_model_name,
+                    trust_remote_code=True,
+                    attn_implementation=attn_implementation,
+                    quantization_config=nf4_config,
+                    torch_dtype=torch.bfloat16 if bf16 else "auto",
+                    device_map=device_map,
                 )
-                self.model = get_peft_model(self.model, lora_config)
+                self.model = PeftModel.from_pretrained(
+                    self.model, 
+                    pretrain_or_model,
+                    is_trainable=True
+                )
+            else:
+                base_model_name = pretrain_or_model
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    pretrain_or_model,
+                    trust_remote_code=True,
+                    attn_implementation=attn_implementation,
+                    quantization_config=nf4_config,
+                    torch_dtype=torch.bfloat16 if bf16 else "auto",
+                    device_map=device_map,
+                )
 
-                if load_in_4bit:
-                    for name, module in self.model.named_modules():
-                        if isinstance(module, LoraLayer):
-                            module = module.to(torch.bfloat16)
-                        if "norm" in name:
-                            module = module.to(torch.float32)
-                        if "lm_head" in name or "embed_tokens" in name:
-                            if hasattr(module, "weight"):
+                # LoRA
+                if lora_rank > 0:
+                    # https://github.com/huggingface/peft/issues/137
+                    self.model.enable_input_require_grads()
+                    lora_config = LoraConfig(
+                        task_type=TaskType.CAUSAL_LM,
+                        r=lora_rank,
+                        lora_alpha=lora_alpha,
+                        target_modules=target_modules,
+                        lora_dropout=lora_dropout,
+                        bias="none",
+                    )
+                    bone_config = BoneConfig(
+                        task_type=TaskType.CAUSAL_LM,
+                        r=lora_rank,
+                        inference_mode=False,
+                        target_modules=target_modules,
+                        init_weights="bat"
+                    )
+                    self.model = get_peft_model(self.model, bone_config)
+
+                    if load_in_4bit:
+                        for name, module in self.model.named_modules():
+                            if isinstance(module, LoraLayer):
                                 module = module.to(torch.bfloat16)
+                            if "norm" in name:
+                                module = module.to(torch.float32)
+                            if "lm_head" in name or "embed_tokens" in name:
+                                if hasattr(module, "weight"):
+                                    module = module.to(torch.bfloat16)
 
             # MoE - balancing loss
             model_config = self.model.config.to_dict()
@@ -115,8 +143,70 @@ class Actor(nn.Module):
 
             # packing samples using Flash Attention 2
             self.packing_samples = packing_samples
+
+            #self.model = self.model.to('cpu')
+            #torch.cuda.empty_cache()
+            self.sgl_engine = sgl.Engine(
+                model_path=base_model_name,
+                random_seed=42,
+                enable_memory_saver=True,
+                mem_fraction_static=0.85,
+                max_running_requests=16,
+                chunked_prefill_size=1024,
+                # context_length=4096,
+                # return_token_ids=True,
+                # disable_cuda_graph=True,  # for debugging only
+            )
+            self.sgl_engine.release_memory_occupation()
         else:
             self.model = pretrain_or_model
+
+    @contextmanager
+    def InferenceMode(self):
+        bone_model = copy.deepcopy(self.model.module)        #self.model.base_model
+        #sgl_model = get_peft_model(base_model,peft_config=self.model.peft_config)
+        #sgl_model.load_state_dict(get_peft_model_state_dict(self.model,save_embedding_layers=False),strict=False)
+        #sgl_model.load_state_dict(self.model.state_dict(),strict=False)
+
+        self.model.cpu()
+        
+        bone_model = bone_model.merge_and_unload(progressbar=True)
+        bone_model.cpu()
+
+        torch.cuda.empty_cache()
+
+        self.sgl_engine.resume_memory_occupation()
+        self.sgl_engine.update_weights_from_tensor(list(bone_model.named_parameters()))
+
+        del bone_model
+
+        try:
+            yield
+        finally:
+            self.sgl_engine.release_memory_occupation()
+            self.model.to(torch.cuda.current_device())
+
+    def generate_sgl(self,input_ids: list[list[int]], **kwargs):
+        sampling_params = {
+            "temperature": kwargs.get("temperature", 1),
+            "top_k": kwargs.get("top_k", -1),
+            "top_p": kwargs.get("top_p", 1.0),
+            "min_new_tokens": kwargs.get("min_new_tokens", 1),
+            "max_new_tokens": kwargs.get("max_new_tokens", 1024),
+            "skip_special_tokens": False,
+            "no_stop_trim": True,
+            "stop": ["\n### Explanation","\n### Test","\n### Example"],
+        }
+        gen_sample = self.sgl_engine.generate(input_ids=input_ids, sampling_params=sampling_params)
+        # 这里注意，因为sglang的return_token_ids还没有合并到主分支，这里先重新tokenizer,以后需要重新化简一下#####
+        gen_text = [sample['text'] for sample in gen_sample]
+        import re
+        for i in range(len(gen_text)):
+            gen_text[i] = re.sub(
+                r"(?:\n### Explanation:?\s*$)|(?:\n### Test:?\s*$)|(?:\n### Example:?\s*$)",
+                "<|im_end|>",gen_text[i],flags=re.DOTALL)
+        #assert len([sample for sample in gen_text if sample[-10:] != "<|im_end|>"]) == 0
+        return gen_text
 
     @torch.no_grad()
     def generate(self, input_ids: torch.Tensor, **kwargs) -> Union[
@@ -188,6 +278,7 @@ class Actor(nn.Module):
         return_output=False,
         ring_attn_group: Optional[dist.ProcessGroup] = None,
         packed_seq_lens: Optional[list[int]] = None,
+        is_ref_model = False
     ) -> torch.Tensor:
         """Returns action log probs"""
         if not self.packing_samples:
@@ -205,7 +296,14 @@ class Actor(nn.Module):
             # explicitly ignore attention_mask for packing_samples
             attention_mask = None
 
-        output = self.model(sequences, attention_mask=attention_mask, position_ids=position_ids)
+        if is_ref_model:
+            with self.model.module.disable_adapter():
+                output = self.model.module(sequences, attention_mask=attention_mask, position_ids=position_ids)
+            # self.model.base_model.disable_adapter_layers()
+            # output = self.model.base_model(sequences, attention_mask=attention_mask, position_ids=position_ids)
+            # self.model.base_model.enable_adapter_layers()
+        else:
+            output = self.model(sequences, attention_mask=attention_mask, position_ids=position_ids)
         # https://github.com/OpenRLHF/OpenRLHF/pull/634
         output["logits"] = output["logits"].to(torch.float32)
 
